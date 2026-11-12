@@ -1,25 +1,13 @@
-#!/usr/bin/env python3
-"""Forecast the top 5 new pump.fun coins by market cap, 24 hours out.
+"""Predict the top new pump.fun coins by market cap, 24 hours out.
 
-Reads the house snapshot history from /input (history.ndjson + task.json)
-and writes one forecast to /output/forecast.json with exactly three keys:
-probabilities, top5, sizes.
+Reads task.json and history.ndjson from the input directory and writes one
+forecast.json to the output directory. Standard library only, no network, no
+randomness, no wall clock: identical input bytes always produce byte-identical
+output bytes.
 
-Stdlib only, deterministic (same history -> same forecast), offline.
-No network, no randomness, no wall-clock dependence.
-
-Model, in one paragraph: for every coin, extrapolate its log market cap to
-the answer reads with a damped momentum trend (1h and 3h windows), rank by
-the extrapolated value, and spread calibrated probability mass around the
-expected rank instead of betting everything on one ordering. Size forecasts
-are discretized log-normal-ish distributions centred on the extrapolated
-place size. Spreading mass is deliberate: the log score punishes confident
-wrong calls far more than it rewards confident right ones, and new-coin
-market caps 6-12h out are dominated by noise and rugs.
-
-Environment overrides (for local testing only; the sandbox uses defaults):
-  MAKEFUN_INPUT  - input directory (default /input)
-  MAKEFUN_OUTPUT - output file path (default /output/forecast.json)
+Input directory: $MAKEFUN_INPUT_DIR, else $MAKEFUN_INPUT, else /input.
+Output: $MAKEFUN_OUTPUT_DIR/forecast.json, else $MAKEFUN_OUTPUT as a file
+path, else /output/forecast.json.
 """
 
 import json
@@ -27,30 +15,36 @@ import math
 import os
 from datetime import datetime, timezone
 
-INPUT_DIR = os.environ.get("MAKEFUN_INPUT", "/input")
-OUTPUT_PATH = os.environ.get("MAKEFUN_OUTPUT", "/output/forecast.json")
-
-MAX_PROB_ROWS_PER_PLACE = 60
-PROB_MASS_PER_PLACE = 0.95
-SIZE_MASS_PER_PLACE = 0.97
-SIZE_SIGMA_LOG10 = 0.35
-MIN_EMITTED_P = 0.001
-MAX_SINGLE_P = 0.60
-FALLBACK_MINTS = [
-    "11111111111111111111111111111111",
-    "22222222222222222222222222222222",
-    "33333333333333333333333333333333",
-    "44444444444444444444444444444444",
-    "55555555555555555555555555555555",
-]
+LAMPORTS_PER_SOL = 1_000_000_000
+DEFAULT_PLACES = 5
+DEFAULT_EDGES = [2.0 + 0.05 * i for i in range(81)]
+DAMPING = 0.7
+TREND_WEIGHT_1H = 0.65
+MAX_MOVE = 1.0
+MAX_HORIZON_HOURS = 24.0
+STALE_DISCOUNT_PER_HOUR = 0.05
+STALE_DISCOUNT_CAP = 0.3
+STABILITY_BONUS = 0.05
+PROB_DISTANCE_SCALE = 2.5
+PROB_MAX_ROWS_PER_PLACE = 60
+PROB_TOTAL_CAP = 0.95
+SIZE_TOTAL_CAP = 0.97
+SIZE_SIGMA = 0.35
+P_MIN = 0.001
+P_MAX = 0.60
+FALLBACK_LOG_CAP = 4.0
+MAX_RATE_PER_HOUR = 2.0
+PLACEHOLDER_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
 def parse_time(value):
-    """Parse an ISO 8601 UTC timestamp; return None when unparseable."""
+    """Parse an ISO-8601 timestamp to epoch seconds, or None if unusable."""
     if not isinstance(value, str):
         return None
     text = value.strip()
-    if text.endswith("Z"):
+    if not text:
+        return None
+    if text.endswith(("Z", "z")):
         text = text[:-1] + "+00:00"
     try:
         parsed = datetime.fromisoformat(text)
@@ -58,309 +52,406 @@ def parse_time(value):
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
-
-
-def mcap_sol(row):
-    """Market cap in SOL from a history row (lamports as decimal string)."""
-    raw = row.get("market_cap_lamports", 0)
     try:
-        lamports = int(str(raw).strip())
-    except (TypeError, ValueError):
-        return 0.0
-    if lamports <= 0:
-        return 0.0
-    return lamports / 1e9
+        return parsed.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def load_task(path):
+    """Load task.json defensively; missing or malformed input yields defaults."""
+    task = {}
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            data = json.load(handle)
-        return data if isinstance(data, dict) else {}
+            loaded = json.load(handle)
+        if isinstance(loaded, dict):
+            task = loaded
     except (OSError, ValueError):
-        return {}
+        task = {}
+    places = task.get("places", DEFAULT_PLACES)
+    if isinstance(places, bool) or not isinstance(places, int):
+        try:
+            places = int(places)
+        except (TypeError, ValueError):
+            places = DEFAULT_PLACES
+    if places < 1 or places > 100:
+        places = DEFAULT_PLACES
+    reads = []
+    raw_reads = task.get("reads")
+    if isinstance(raw_reads, list):
+        for item in raw_reads:
+            stamp = parse_time(item)
+            if stamp is not None:
+                reads.append(stamp)
+    edges = DEFAULT_EDGES
+    size = task.get("size")
+    if isinstance(size, dict):
+        raw_edges = size.get("edges")
+        if isinstance(raw_edges, list) and len(raw_edges) >= 1:
+            cleaned = []
+            usable = True
+            for edge in raw_edges:
+                if isinstance(edge, bool) or not isinstance(edge, (int, float)):
+                    usable = False
+                    break
+                value = float(edge)
+                if not math.isfinite(value):
+                    usable = False
+                    break
+                cleaned.append(value)
+            if usable and all(b > a for a, b in zip(cleaned, cleaned[1:])):
+                edges = cleaned
+    return places, reads, edges
 
 
-def load_history(path):
-    marks = []
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    mark = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(mark, dict):
-                    marks.append(mark)
-    except OSError:
-        return []
-    return marks
+MAX_MARK_LINE_BYTES = 1_000_000
 
 
-def collect_series(marks):
-    """Per-mint time series of (mark_index, log10 mcap SOL, rank).
+def iter_marks(path):
+    """Yield (epoch, rows) for each usable mark line, oldest first.
 
-    Marks are oldest-first. A mint absent from a mark's top-200 rows is
-    treated as faded: it keeps its last observed value but is flagged stale
-    so the forecaster can discount it.
+    The file is read as bytes and each line decoded separately, so one bad
+    byte sequence or one absurdly long line cannot poison the whole history.
     """
-    series = {}
-    last_mark_index = len(marks) - 1
-    for index, mark in enumerate(marks):
-        if mark.get("ok") is False:
-            continue
-        rows = mark.get("rows")
-        if not isinstance(rows, list):
-            continue
+    try:
+        handle = open(path, "rb")
+    except OSError:
+        return
+    with handle:
+        for raw in handle:
+            if len(raw) > MAX_MARK_LINE_BYTES:
+                continue
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                mark = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(mark, dict):
+                continue
+            if mark.get("ok") is False:
+                continue
+            stamp = parse_time(mark.get("at"))
+            if stamp is None:
+                continue
+            rows = mark.get("rows")
+            if not isinstance(rows, list):
+                continue
+            yield stamp, rows
+
+
+def parse_cap_lamports(value):
+    """Parse a market-cap value in lamports to a positive float, or None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return number
+
+
+def parse_rank(value):
+    """Parse a rank to an int, or None if it is not a whole number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or int(value) != value:
+        return None
+    return int(value)
+
+
+def scan_history(path):
+    """Single pass over marks; returns per-mint series plus global facts."""
+    mints = {}
+    total_marks = 0
+    last_mark_time = None
+    for stamp, rows in iter_marks(path):
+        total_marks += 1
+        if last_mark_time is None or stamp > last_mark_time:
+            last_mark_time = stamp
+        seen_this_mark = set()
         for row in rows:
             if not isinstance(row, dict):
                 continue
             mint = row.get("mint")
             if not isinstance(mint, str) or not mint:
                 continue
-            cap = mcap_sol(row)
-            if cap <= 0:
+            cap = parse_cap_lamports(row.get("market_cap_lamports"))
+            if cap is None:
                 continue
-            entry = series.setdefault(
-                mint, {"points": [], "venue": None, "complete": False,
-                       "mayhem": False, "created_at": None}
+            if mint in seen_this_mark:
+                continue
+            seen_this_mark.add(mint)
+            log_cap = math.log10(cap / LAMPORTS_PER_SOL)
+            if not math.isfinite(log_cap):
+                continue
+            state = mints.get(mint)
+            if state is None:
+                state = {
+                    "points": [],
+                    "appearances": 0,
+                    "top20": 0,
+                    "first_mark": total_marks,
+                    "last_time": stamp,
+                }
+                mints[mint] = state
+            state["points"].append((stamp, log_cap))
+            if stamp > state["last_time"]:
+                state["last_time"] = stamp
+            state["appearances"] += 1
+            rank = parse_rank(row.get("rank"))
+            if rank is not None and rank <= 20:
+                state["top20"] += 1
+    return mints, total_marks, last_mark_time
+
+
+def trailing_rate(points, last_time, last_value, window_seconds):
+    """Log10 change per hour over a trailing window ending at the last point.
+
+    The reference is the latest point at or before the window start, or the
+    earliest point when the series is shorter than the window; the rate is
+    scaled by the actual elapsed time and clamped to a sane band.
+    """
+    target = last_time - window_seconds
+    ref_time = None
+    ref_value = None
+    for stamp, value in points:
+        if stamp <= target:
+            ref_time, ref_value = stamp, value
+        else:
+            break
+    if ref_time is None:
+        ref_time, ref_value = points[0]
+    elapsed_hours = (last_time - ref_time) / 3600.0
+    if elapsed_hours < 1.0 / 60.0:
+        return 0.0
+    rate = (last_value - ref_value) / elapsed_hours
+    return max(-MAX_RATE_PER_HOUR, min(MAX_RATE_PER_HOUR, rate))
+
+
+def predict(mints, total_marks, last_mark_time, horizon_hours):
+    """Return {mint: (predicted log10 cap in SOL, stability)} for each mint."""
+    predictions = {}
+    for mint, state in mints.items():
+        points = sorted(state["points"])
+        last_time, last_value = points[-1]
+        rate_1h = trailing_rate(points, last_time, last_value, 3600.0)
+        rate_3h = trailing_rate(points, last_time, last_value, 3 * 3600.0)
+        blended = TREND_WEIGHT_1H * rate_1h + (1.0 - TREND_WEIGHT_1H) * rate_3h
+        move = blended * horizon_hours * DAMPING
+        move = max(-MAX_MOVE, min(MAX_MOVE, move))
+        stale_hours = max(0.0, (last_mark_time - state["last_time"]) / 3600.0)
+        discount = min(STALE_DISCOUNT_PER_HOUR * stale_hours, STALE_DISCOUNT_CAP)
+        span = max(1, total_marks - state["first_mark"] + 1)
+        presence = state["appearances"] / span
+        top20_fraction = state["top20"] / max(1, state["appearances"])
+        stability = max(0.0, min(1.0, 0.6 * top20_fraction + 0.4 * presence))
+        predicted = last_value + move - discount + STABILITY_BONUS * stability
+        # A non-finite prediction (from pathological inputs) must never reach
+        # the ranking: fall back to the last observed cap, then keep the
+        # prediction inside a band wide enough for any real pump.fun coin
+        # (10^-3 to 10^12 SOL) so one wild series cannot dominate the sizes.
+        if not math.isfinite(predicted):
+            predicted = last_value
+        predicted = max(-3.0, min(12.0, predicted))
+        predictions[mint] = (predicted, stability)
+    return predictions
+
+
+def rank_mints(predictions):
+    """Mints by predicted log cap descending, ties by mint bytes ascending."""
+    return sorted(predictions, key=lambda m: (-predictions[m][0], m.encode("utf-8")))
+
+
+def normalize_capped(items, total_cap):
+    """Scale positive weights to sum at most total_cap, each p in [P_MIN, P_MAX].
+
+    Drops the smallest entries and renormalizes until every survivor clears
+    the floor; capping at P_MAX only ever lowers the total.
+    """
+    current = [
+        (key, weight)
+        for key, weight in items
+        if weight > 0 and math.isfinite(weight)
+    ]
+    if not current:
+        return []
+    while True:
+        total = sum(weight for _, weight in current)
+        scaled = [(key, weight / total * total_cap) for key, weight in current]
+        if len(scaled) == 1:
+            key, prob = scaled[0]
+            return [(key, max(P_MIN, min(P_MAX, prob)))]
+        kept = [(key, prob) for key, prob in scaled if prob >= P_MIN]
+        if len(kept) == len(scaled):
+            return [(key, min(P_MAX, prob)) for key, prob in kept]
+        if not kept:
+            key, prob = max(scaled, key=lambda item: item[1])
+            return [(key, max(P_MIN, min(P_MAX, prob)))]
+        current = kept
+
+
+def build_probabilities(ranked, predictions, places):
+    """Per place, spread mass over the ranked list, decaying with distance."""
+    rows = []
+    for place in range(1, places + 1):
+        weighted = []
+        for index, mint in enumerate(ranked):
+            distance = abs(index - (place - 1))
+            stability = predictions[mint][1]
+            weight = math.exp(-distance / PROB_DISTANCE_SCALE) * (
+                0.7 + 0.3 * stability
             )
-            entry["points"].append(
-                (index, math.log10(cap), row.get("rank")))
-            entry["venue"] = row.get("venue", entry["venue"])
-            entry["complete"] = bool(row.get("complete", entry["complete"]))
-            entry["mayhem"] = bool(row.get("mayhem", entry["mayhem"]))
-            if entry["created_at"] is None:
-                entry["created_at"] = row.get("created_at")
-    for mint, entry in series.items():
-        entry["stale_marks"] = last_mark_index - entry["points"][-1][0]
-    return series
-
-
-def trend_per_hour(points, marks_per_hour, window_hours):
-    """Log10 mcap change per hour over the trailing window, or 0.0."""
-    if len(points) < 2 or marks_per_hour <= 0:
-        return 0.0
-    window_marks = max(1, int(round(window_hours * marks_per_hour)))
-    last_index, last_value, _ = points[-1]
-    target_index = last_index - window_marks
-    base_value = None
-    for mark_index, value, _ in points:
-        if mark_index <= target_index:
-            base_value = value
-        else:
-            break
-    if base_value is None:
-        base_value = points[0][1]
-        span_marks = last_index - points[0][0]
-    else:
-        span_marks = window_marks
-    if span_marks <= 0:
-        return 0.0
-    return (last_value - base_value) / (span_marks / marks_per_hour)
-
-
-def predict_log_mcap(entry, marks_per_hour, horizon_hours):
-    """Damped extrapolation of log10 mcap to the answer reads."""
-    points = entry["points"]
-    last_value = points[-1][1]
-    trend_1h = trend_per_hour(points, marks_per_hour, 1.0)
-    trend_3h = trend_per_hour(points, marks_per_hour, 3.0)
-    trend = 0.6 * trend_1h + 0.4 * trend_3h
-    # Damping: momentum persists, but rarely at full strength for hours.
-    # Clamp the total move so one hot hour cannot dominate the forecast.
-    move = trend * horizon_hours * 0.4
-    move = max(-1.0, min(1.0, move))
-    predicted = last_value + move
-    # Stale coins (dropped out of the top-200 rows) are fading: discount.
-    stale = entry.get("stale_marks", 0)
-    if stale > 0 and marks_per_hour > 0:
-        predicted -= min(0.75, 0.15 * (stale / marks_per_hour))
-    return predicted
-
-
-def stability_bonus(entry, marks_per_hour):
-    """Small bonus for coins that held a top rank steadily (0..1 scale)."""
-    points = entry["points"]
-    if not points:
-        return 0.0
-    top_ranks = [rank for _, _, rank in points
-                 if isinstance(rank, int) and rank <= 20]
-    return len(top_ranks) / len(points)
-
-
-def rank_key(item):
-    """Sort key: predicted log mcap desc, then mint bytes ascending."""
-    mint, predicted, _ = item
-    return (-predicted, mint.encode("utf-8"))
-
-
-def normalize_rows(weighted, mass, cap, floor, limit):
-    """Turn (key, weight) pairs into a rounded distribution summing <= mass.
-
-    Deterministic: sorted by weight desc, then key bytes ascending.
-    """
-    if not weighted:
-        return []
-    ordered = sorted(weighted, key=lambda kv: (-kv[1], str(kv[0]).encode()))
-    total = sum(weight for _, weight in ordered)
-    if total <= 0:
-        return []
-    rows = []
-    for key, weight in ordered[:limit]:
-        prob = mass * weight / total
-        if prob < floor:
-            continue
-        rows.append([key, min(cap, prob)])
-    # Renormalize after flooring/capping so the sum stays <= mass.
-    total = sum(prob for _, prob in rows)
-    if total > mass and total > 0:
-        rows = [[key, prob * mass / total] for key, prob in rows]
-    rounded = [[key, round(prob, 6)] for key, prob in rows]
-    rounded = [[key, prob] for key, prob in rounded if prob >= floor]
-    total = sum(prob for _, prob in rounded)
-    if total > 1.0:
-        excess = total - 1.0
-        rounded.sort(key=lambda kv: -kv[1])
-        for row in rounded:
-            cut = min(row[1] - floor, excess)
-            if cut > 0:
-                row[1] = round(row[1] - cut, 6)
-                excess -= cut
-            if excess <= 0:
-                break
-    return rounded
-
-
-def build_probabilities(ranked, places):
-    """Per-place probability rows over the ranked candidate list."""
-    rows = []
-    n = len(ranked)
-    for place in range(1, places + 1):
-        weighted = []
-        for position, (mint, _, stable) in enumerate(ranked):
-            distance = abs(position + 1 - place)
-            weight = math.exp(-distance / 2.5) * (0.7 + 0.3 * stable)
             weighted.append((mint, weight))
-        for mint, prob in normalize_rows(
-                weighted, PROB_MASS_PER_PLACE, MAX_SINGLE_P,
-                MIN_EMITTED_P, MAX_PROB_ROWS_PER_PLACE):
+        weighted.sort(key=lambda item: (-item[1], item[0].encode("utf-8")))
+        top = weighted[:PROB_MAX_ROWS_PER_PLACE]
+        for mint, prob in normalize_capped(top, PROB_TOTAL_CAP):
             rows.append({"mint": mint, "place": place, "p": prob})
-    rows.sort(key=lambda r: (r["place"], -r["p"], r["mint"].encode()))
+    rows.sort(key=lambda row: (row["place"], -row["p"], row["mint"].encode("utf-8")))
     return rows
 
 
-def size_bin_centers(edges):
-    """Bin centres for the log10 size bins defined by `edges`.
+def normal_cdf(z):
+    """Standard normal cumulative distribution function."""
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
-    81 edges define 82 bins: bin 0 below the first edge, bin 81 above the
-    last edge, interior bins between consecutive edges.
+
+def build_sizes(ranked, predictions, places, edges):
+    """Per place, a Gaussian-like size distribution over the log10 cap bins.
+
+    Bin 0 sits below the first edge, bin k between edges[k-1] and edges[k],
+    and the last bin above the final edge.
     """
-    centers = []
-    if not edges:
-        edges = [2.00 + 0.05 * i for i in range(81)]
-    step = 0.05
-    if len(edges) >= 2:
-        step = (edges[-1] - edges[0]) / (len(edges) - 1)
-    centers.append(edges[0] - step / 2.0)
-    for i in range(len(edges) - 1):
-        centers.append((edges[i] + edges[i + 1]) / 2.0)
-    centers.append(edges[-1] + step / 2.0)
-    return centers
-
-
-def build_sizes(ranked, places, edges):
-    """Per-place size-bin distributions centred on the extrapolated size."""
-    centers = size_bin_centers(edges)
+    bin_count = len(edges) + 1
     rows = []
     for place in range(1, places + 1):
-        if place <= len(ranked):
-            centre = ranked[place - 1][1]
-        elif ranked:
-            centre = ranked[-1][1]
+        if ranked:
+            anchor = ranked[min(place - 1, len(ranked) - 1)]
+            center = predictions[anchor][0]
         else:
-            centre = 4.0
-        weighted = []
-        for bin_index, bin_centre in enumerate(centers):
-            z = (bin_centre - centre) / SIZE_SIGMA_LOG10
-            weighted.append((bin_index, math.exp(-0.5 * z * z)))
-        for bin_index, prob in normalize_rows(
-                weighted, SIZE_MASS_PER_PLACE, MAX_SINGLE_P,
-                MIN_EMITTED_P, len(centers)):
-            rows.append({"place": place, "bin": bin_index, "p": prob})
-    rows.sort(key=lambda r: (r["place"], r["bin"]))
+            center = FALLBACK_LOG_CAP
+        masses = []
+        for b in range(bin_count):
+            lower = edges[b - 1] if b > 0 else None
+            upper = edges[b] if b < len(edges) else None
+            upper_mass = (
+                normal_cdf((upper - center) / SIZE_SIGMA) if upper is not None else 1.0
+            )
+            lower_mass = (
+                normal_cdf((lower - center) / SIZE_SIGMA) if lower is not None else 0.0
+            )
+            masses.append((b, max(0.0, upper_mass - lower_mass)))
+        for b, prob in normalize_capped(masses, SIZE_TOTAL_CAP):
+            rows.append({"place": place, "bin": b, "p": prob})
+    rows.sort(key=lambda row: (row["place"], row["bin"]))
     return rows
 
 
-def build_forecast(marks, task):
-    places = task.get("places", 5)
-    if not isinstance(places, int) or places < 1:
-        places = 5
-    places = min(places, 5)
+def placeholder_mints(count, taken):
+    """Distinct 32-char placeholder mints that never collide with real ones."""
+    used = set(taken)
+    placeholders = []
+    char_index = 0
+    while len(placeholders) < count and char_index < len(PLACEHOLDER_ALPHABET):
+        candidate = PLACEHOLDER_ALPHABET[char_index] * 32
+        char_index += 1
+        if candidate not in used:
+            used.add(candidate)
+            placeholders.append(candidate)
+    numeric = 0
+    while len(placeholders) < count:
+        candidate = "%032d" % numeric
+        numeric += 1
+        if candidate not in used:
+            used.add(candidate)
+            placeholders.append(candidate)
+    return placeholders
 
-    cadence = task.get("cadence_minutes", 10)
-    if not isinstance(cadence, (int, float)) or cadence <= 0:
-        cadence = 10
-    marks_per_hour = 60.0 / cadence
 
-    horizon_hours = 12.0
-    last_at = None
-    for mark in reversed(marks):
-        last_at = parse_time(mark.get("at"))
-        if last_at is not None:
-            break
-    reads = task.get("reads")
-    if isinstance(reads, list) and reads and last_at is not None:
-        last_read = parse_time(reads[-1])
-        if last_read is not None:
-            horizon_hours = (last_read - last_at).total_seconds() / 3600.0
-            horizon_hours = max(0.0, min(24.0, horizon_hours))
-
-    series = collect_series(marks)
-    ranked = []
-    for mint, entry in series.items():
-        predicted = predict_log_mcap(entry, marks_per_hour, horizon_hours)
-        ranked.append((mint, predicted, stability_bonus(entry, marks_per_hour)))
-    ranked.sort(key=rank_key)
-
-    top5 = [mint for mint, _, _ in ranked[:places]]
-    if len(top5) < places:
-        seen = set(top5)
-        for fallback in FALLBACK_MINTS:
-            if len(top5) >= places:
-                break
-            if fallback not in seen:
-                top5.append(fallback)
-                seen.add(fallback)
-
-    size_cfg = task.get("size", {})
-    edges = size_cfg.get("edges") if isinstance(size_cfg, dict) else None
-    if not isinstance(edges, list) or len(edges) < 2:
-        edges = [2.00 + 0.05 * i for i in range(81)]
-
+def build_forecast(places, reads, edges, mints, total_marks, last_mark_time):
+    """Assemble the forecast object from the scanned history."""
+    horizon = MAX_HORIZON_HOURS
+    if last_mark_time is not None and reads:
+        horizon = (max(reads) - last_mark_time) / 3600.0
+        horizon = max(0.0, min(MAX_HORIZON_HOURS, horizon))
+    if last_mark_time is not None:
+        predictions = predict(mints, total_marks, last_mark_time, horizon)
+    else:
+        predictions = {}
+    ranked = rank_mints(predictions)
+    top = ranked[:places]
+    if len(top) < places:
+        top = top + placeholder_mints(places - len(top), ranked)
     return {
-        "probabilities": build_probabilities(ranked, places),
-        "top5": top5,
-        "sizes": build_sizes(ranked, places, edges),
+        "probabilities": build_probabilities(ranked, predictions, places),
+        "top5": top,
+        "sizes": build_sizes(ranked, predictions, places, edges),
+    }
+
+
+def resolve_paths():
+    """Input directory and output file path from the environment."""
+    input_dir = (
+        os.environ.get("MAKEFUN_INPUT_DIR")
+        or os.environ.get("MAKEFUN_INPUT")
+        or "/input"
+    )
+    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR")
+    output_file = os.environ.get("MAKEFUN_OUTPUT")
+    if output_dir:
+        out_path = os.path.join(output_dir, "forecast.json")
+    elif output_file:
+        if output_file.endswith(os.sep) or os.path.isdir(output_file):
+            out_path = os.path.join(output_file, "forecast.json")
+        else:
+            out_path = output_file
+    else:
+        out_path = os.path.join("/output", "forecast.json")
+    return input_dir, out_path
+
+
+def run(input_dir):
+    """Load inputs and build the forecast; raises only on unexpected errors."""
+    places, reads, edges = load_task(os.path.join(input_dir, "task.json"))
+    mints, total_marks, last_mark_time = scan_history(
+        os.path.join(input_dir, "history.ndjson")
+    )
+    return build_forecast(places, reads, edges, mints, total_marks, last_mark_time)
+
+
+def fallback_forecast():
+    """A valid forecast with no history: placeholders plus a centered spread."""
+    return {
+        "probabilities": [],
+        "top5": placeholder_mints(DEFAULT_PLACES, ()),
+        "sizes": build_sizes([], {}, DEFAULT_PLACES, DEFAULT_EDGES),
     }
 
 
 def main():
-    task = load_task(os.path.join(INPUT_DIR, "task.json"))
-    marks = load_history(os.path.join(INPUT_DIR, "history.ndjson"))
-    forecast = build_forecast(marks, task)
-    parent = os.path.dirname(OUTPUT_PATH)
+    input_dir, out_path = resolve_paths()
+    try:
+        forecast = run(input_dir)
+    except Exception:
+        forecast = fallback_forecast()
+    parent = os.path.dirname(out_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    with open(OUTPUT_PATH, "w", encoding="utf-8") as handle:
-        json.dump(forecast, handle, sort_keys=True, separators=(",", ":"))
-        handle.write("\n")
-    return 0
+    text = json.dumps(forecast, sort_keys=True, separators=(",", ":")) + "\n"
+    with open(out_path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
