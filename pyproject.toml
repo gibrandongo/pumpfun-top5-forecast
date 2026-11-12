@@ -1,0 +1,8 @@
+[project]
+name = "pumpfun-top5-forecast"
+version = "1.0.0"
+description = "Forecast the top 5 new pump.fun coins by market cap, 24 hours out, for the make.fun bounty."
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+dependencies = []
